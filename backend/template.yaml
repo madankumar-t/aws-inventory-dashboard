@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Enterprise AWS Inventory Dashboard - Multi-Account, Multi-Region
+
+Parameters:
+  ExternalId:
+    Type: String
+    Description: External ID for AssumeRole (security best practice)
+    Default: ""
+  InventoryRoleName:
+    Type: String
+    Description: Name of the IAM role to assume in member accounts
+    Default: InventoryReadRole
+  CognitoDomain:
+    Type: String
+    Description: Cognito Hosted UI domain (optional, for SAML federation)
+    Default: ""
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300  # Increased for multi-region queries
+    MemorySize: 512  # Increased for parallel processing
+      Environment:
+        Variables:
+          EXTERNAL_ID: !Ref ExternalId
+          INVENTORY_ROLE_NAME: !Ref InventoryRoleName
+          ROLE_SESSION_NAME: InventoryDashboardSession
+          # Optional: Hardcoded accounts (fallback if Organizations not available)
+          # Format: "accountId1:AccountName1,accountId2:AccountName2" or "accountId1,accountId2"
+          # INVENTORY_ACCOUNTS: ""
+
+Resources:
+
+  ########################################
+  # API GATEWAY
+  ########################################
+  InventoryApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,OPTIONS,POST'"
+        AllowHeaders: "'Authorization,Content-Type'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 3600
+
+  ########################################
+  # LAMBDA FUNCTION
+  ########################################
+  InventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/app.lambda_handler
+      CodeUri: src/
+      Layers:
+        - !Ref PythonDependenciesLayer
+      
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                # EC2
+                - ec2:Describe*
+                - ec2:DescribeInstances
+                - ec2:DescribeVpcs
+                - ec2:DescribeSubnets
+                - ec2:DescribeSecurityGroups
+                
+                # S3
+                - s3:ListAllMyBuckets
+                - s3:GetBucketLocation
+                - s3:GetBucketVersioning
+                - s3:GetBucketEncryption
+                - s3:GetBucketPolicyStatus
+                - s3:GetBucketTagging
+                
+                # RDS
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+                
+                # DynamoDB
+                - dynamodb:ListTables
+                - dynamodb:DescribeTable
+                
+                # IAM
+                - iam:ListRoles
+                - iam:GetRole
+                - iam:GetRolePolicy
+                
+                # VPC
+                - ec2:DescribeVpcs
+                - ec2:DescribeSubnets
+                - ec2:DescribeRouteTables
+                - ec2:DescribeInternetGateways
+                
+                # EKS
+                - eks:ListClusters
+                - eks:DescribeCluster
+                - eks:ListNodegroups
+                - eks:DescribeNodegroup
+                
+                # ECS
+                - ecs:ListClusters
+                - ecs:DescribeClusters
+                - ecs:ListServices
+                - ecs:ListTasks
+                
+                # Organizations (for multi-account)
+                - organizations:ListAccounts
+                - organizations:DescribeAccount
+                - organizations:ListOrganizationalUnitsForParent
+                
+                # STS (for AssumeRole)
+                - sts:AssumeRole
+                - sts:GetCallerIdentity
+              Resource: "*"
+
+      Events:
+        InventoryApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InventoryApi
+            Path: /inventory
+            Method: ANY
+            Auth:
+              Authorizer: CognitoAuth
+        
+        InventoryAccountsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InventoryApi
+            Path: /accounts
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+        
+        InventorySummaryApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InventoryApi
+            Path: /inventory/summary
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+        
+        InventoryExportApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InventoryApi
+            Path: /inventory/export
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+        
+        InventoryDetailsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InventoryApi
+            Path: /inventory/details
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+
+  ########################################
+  # LAMBDA LAYER FOR DEPENDENCIES
+  ########################################
+  PythonDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: InventoryDependencies
+      Description: Python dependencies for inventory function
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Retain
+
+  ########################################
+  # COGNITO USER POOL
+  ########################################
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: AwsInventoryUsers
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: groups
+          AttributeDataType: String
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      # SAML Identity Provider (configure after deployment)
+      # See documentation for SAML setup
+
+  ########################################
+  # COGNITO USER POOL DOMAIN (for Hosted UI)
+  ########################################
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !If
+        - HasCognitoDomain
+        - !Ref CognitoDomain
+        - !Sub "${AWS::StackName}-auth"
+      UserPoolId: !Ref CognitoUserPool
+
+  ########################################
+  # COGNITO APP CLIENT
+  ########################################
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: AwsInventoryClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - http://localhost:3000/auth/callback
+        - http://localhost:3000
+        - https://your-domain.com/auth/callback
+      LogoutURLs:
+        - http://localhost:3000
+        - https://your-domain.com
+      SupportedIdentityProviders:
+        - COGNITO
+        # Add SAML provider name here after creating it
+
+  ########################################
+  # COGNITO IDENTITY PROVIDER (SAML)
+  # Uncomment and configure after deployment
+  ########################################
+  # CognitoSAMLIdentityProvider:
+  #   Type: AWS::Cognito::UserPoolIdentityProvider
+  #   Properties:
+  #     UserPoolId: !Ref CognitoUserPool
+  #     ProviderName: AzureAD  # or Okta, Ping, ADFS
+  #     ProviderType: SAML
+  #     ProviderDetails:
+  #       MetadataURL: https://login.microsoftonline.com/.../federationmetadata/2007-06/federationmetadata.xml
+  #       # OR MetadataDocument: |
+  #       #   <EntityDescriptor>...</EntityDescriptor>
+  #     AttributeMapping:
+  #       email: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+  #       groups: http://schemas.microsoft.com/ws/2008/06/identity/claims/groups
+
+  ########################################
+  # API GATEWAY CORS FOR 4XX
+  ########################################
+  ApiGatewayDefault4xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref InventoryApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+
+  ########################################
+  # API GATEWAY CORS FOR 5XX
+  ########################################
+  ApiGatewayDefault5xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref InventoryApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+
+  ########################################
+  # CLOUDWATCH LOG GROUP
+  ########################################
+  InventoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${InventoryFunction}
+      RetentionInDays: 30
+
+Conditions:
+  HasCognitoDomain: !Not [!Equals [!Ref CognitoDomain, ""]]
+
+########################################
+# OUTPUTS
+########################################
+Outputs:
+  ApiUrl:
+    Description: Inventory API base URL
+    Value: !Sub https://${InventoryApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiUrl
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  ClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-ClientId
+
+  CognitoDomain:
+    Description: Cognito Hosted UI Domain
+    Value: !GetAtt CognitoUserPoolDomain.Domain
+    Export:
+      Name: !Sub ${AWS::StackName}-CognitoDomain
+
+  CognitoHostedUIUrl:
+    Description: Cognito Hosted UI URL for SSO login
+    Value: !Sub https://${CognitoUserPoolDomain.Domain}.auth.${AWS::Region}.amazoncognito.com
+    Export:
+      Name: !Sub ${AWS::StackName}-CognitoHostedUIUrl
